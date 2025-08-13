@@ -1,0 +1,2363 @@
+#!/usr/bin/env python3
+"""
+File Integrity Monitoring Tool
+A comprehensive tool to monitor file changes using hash calculations.
+Supports multiple hash algorithms and provides both GUI and CLI interfaces.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import os
+import sys
+import json
+import hashlib
+import time
+import threading
+from pathlib import Path
+import argparse
+from datetime import datetime
+import sqlite3
+from collections import defaultdict
+import fnmatch
+
+class FileIntegrityMonitor:
+    """Core file integrity monitoring functionality"""
+    
+    SUPPORTED_ALGORITHMS = ['md5', 'sha1', 'sha256', 'sha512', 'blake2b']
+    
+    def __init__(self, db_path="file_integrity.db"):
+        self.db_path = db_path
+        self.init_database()
+        
+    def init_database(self):
+        """Initialize SQLite database for storing hash records"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                file_size INTEGER,
+                hash_algorithm TEXT NOT NULL,
+                hash_value TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                status TEXT DEFAULT 'monitored',
+                UNIQUE(file_path, hash_algorithm)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                old_hash TEXT,
+                new_hash TEXT,
+                old_size INTEGER,
+                new_size INTEGER,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def calculate_hash(self, file_path, algorithm='sha256', chunk_size=8192):
+        """Calculate hash of a file using specified algorithm"""
+        if algorithm not in self.SUPPORTED_ALGORITHMS:
+            raise ValueError(f"Unsupported algorithm: {algorithm}")
+        
+        hasher = hashlib.new(algorithm)
+        
+        try:
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(chunk_size):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            raise Exception(f"Error calculating hash for {file_path}: {str(e)}")
+    
+    def get_file_info(self, file_path):
+        """Get file information including size and modification time"""
+        try:
+            stat = os.stat(file_path)
+            return {
+                'size': stat.st_size,
+                'mtime': stat.st_mtime,
+                'exists': True
+            }
+        except FileNotFoundError:
+            return {'exists': False}
+        except Exception as e:
+            raise Exception(f"Error accessing file {file_path}: {str(e)}")
+    
+    def add_file_to_monitor(self, file_path, algorithm='sha256'):
+        """Add a file to the monitoring database"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        file_path = os.path.abspath(file_path)
+        file_info = self.get_file_info(file_path)
+        hash_value = self.calculate_hash(file_path, algorithm)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO file_hashes 
+            (file_path, file_size, hash_algorithm, hash_value, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (file_path, file_info['size'], algorithm, hash_value, 
+              datetime.now().isoformat(), 'monitored'))
+        
+        conn.commit()
+        conn.close()
+        
+        return hash_value
+    
+    def add_directory_to_monitor(self, dir_path, algorithm='sha256', recursive=True, 
+                               include_patterns=None, exclude_patterns=None):
+        """Add all files in a directory to monitoring"""
+        if not os.path.isdir(dir_path):
+            raise NotADirectoryError(f"Directory not found: {dir_path}")
+        
+        added_files = []
+        include_patterns = include_patterns or ['*']
+        exclude_patterns = exclude_patterns or []
+        
+        def should_include_file(filepath):
+            filename = os.path.basename(filepath)
+            
+            # Check include patterns
+            if not any(fnmatch.fnmatch(filename, pattern) for pattern in include_patterns):
+                return False
+            
+            # Check exclude patterns
+            if any(fnmatch.fnmatch(filename, pattern) for pattern in exclude_patterns):
+                return False
+            
+            return True
+        
+        if recursive:
+            for root, dirs, files in os.walk(dir_path):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    if should_include_file(filepath):
+                        try:
+                            self.add_file_to_monitor(filepath, algorithm)
+                            added_files.append(filepath)
+                        except Exception as e:
+                            print(f"Warning: Could not add {filepath}: {e}")
+        else:
+            for item in os.listdir(dir_path):
+                filepath = os.path.join(dir_path, item)
+                if os.path.isfile(filepath) and should_include_file(filepath):
+                    try:
+                        self.add_file_to_monitor(filepath, algorithm)
+                        added_files.append(filepath)
+                    except Exception as e:
+                        print(f"Warning: Could not add {filepath}: {e}")
+        
+        return added_files
+    
+    def check_file_integrity(self, file_path, algorithm='sha256'):
+        """Check if a monitored file has been modified"""
+        file_path = os.path.abspath(file_path)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT hash_value, file_size, timestamp FROM file_hashes 
+            WHERE file_path = ? AND hash_algorithm = ?
+        ''', (file_path, algorithm))
+        
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            raise ValueError(f"File {file_path} is not being monitored with {algorithm}")
+        
+        stored_hash, stored_size, stored_timestamp = result
+        
+        # Check if file still exists
+        if not os.path.exists(file_path):
+            # Log file deletion
+            cursor.execute('''
+                INSERT INTO change_log 
+                (file_path, change_type, old_hash, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (file_path, 'deleted', stored_hash, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            
+            return {
+                'changed': True,
+                'change_type': 'deleted',
+                'old_hash': stored_hash,
+                'stored_size': stored_size,
+                'stored_timestamp': stored_timestamp
+            }
+        
+        # Calculate current hash
+        current_info = self.get_file_info(file_path)
+        current_hash = self.calculate_hash(file_path, algorithm)
+        
+        if current_hash != stored_hash:
+            # Log file modification
+            cursor.execute('''
+                INSERT INTO change_log 
+                (file_path, change_type, old_hash, new_hash, old_size, new_size, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (file_path, 'modified', stored_hash, current_hash, 
+                  stored_size, current_info['size'], datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            
+            return {
+                'changed': True,
+                'change_type': 'modified',
+                'old_hash': stored_hash,
+                'new_hash': current_hash,
+                'old_size': stored_size,
+                'new_size': current_info['size'],
+                'stored_timestamp': stored_timestamp
+            }
+        
+        conn.close()
+        return {'changed': False, 'hash': current_hash}
+    
+    def check_all_monitored_files(self, algorithm=None):
+        """Check integrity of all monitored files"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if algorithm:
+            cursor.execute('SELECT DISTINCT file_path, hash_algorithm FROM file_hashes WHERE hash_algorithm = ?', (algorithm,))
+        else:
+            cursor.execute('SELECT DISTINCT file_path, hash_algorithm FROM file_hashes')
+        
+        files = cursor.fetchall()
+        conn.close()
+        
+        results = []
+        for file_path, hash_algo in files:
+            try:
+                result = self.check_file_integrity(file_path, hash_algo)
+                result['file_path'] = file_path
+                result['algorithm'] = hash_algo
+                results.append(result)
+            except Exception as e:
+                results.append({
+                    'file_path': file_path,
+                    'algorithm': hash_algo,
+                    'error': str(e),
+                    'changed': None
+                })
+        
+        return results
+    
+    def get_monitored_files(self):
+        """Get list of all monitored files"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT file_path, file_size, hash_algorithm, hash_value, timestamp, status
+            FROM file_hashes ORDER BY file_path
+        ''')
+        
+        files = cursor.fetchall()
+        conn.close()
+        
+        return [{'file_path': f[0], 'file_size': f[1], 'algorithm': f[2], 
+                'hash_value': f[3], 'timestamp': f[4], 'status': f[5]} for f in files]
+    
+    def get_change_history(self, file_path=None, limit=100):
+        """Get change history"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if file_path:
+            cursor.execute('''
+                SELECT file_path, change_type, old_hash, new_hash, old_size, new_size, timestamp
+                FROM change_log WHERE file_path = ? ORDER BY timestamp DESC LIMIT ?
+            ''', (file_path, limit))
+        else:
+            cursor.execute('''
+                SELECT file_path, change_type, old_hash, new_hash, old_size, new_size, timestamp
+                FROM change_log ORDER BY timestamp DESC LIMIT ?
+            ''', (limit,))
+        
+        changes = cursor.fetchall()
+        conn.close()
+        
+        return [{'file_path': c[0], 'change_type': c[1], 'old_hash': c[2], 
+                'new_hash': c[3], 'old_size': c[4], 'new_size': c[5], 
+                'timestamp': c[6]} for c in changes]
+    
+    def remove_from_monitoring(self, file_path):
+        """Remove a file from monitoring"""
+        file_path = os.path.abspath(file_path)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('DELETE FROM file_hashes WHERE file_path = ?', (file_path,))
+        rows_affected = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        return rows_affected > 0
+    
+    def update_baseline(self, file_path, algorithm='sha256'):
+        """Update the baseline hash for a file"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        self.add_file_to_monitor(file_path, algorithm)  # This will replace existing entry
+        return True
+
+
+class FileIntegrityGUI:
+    """GUI interface for the file integrity monitor"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.monitor = FileIntegrityMonitor()
+        self.root.title("🛡️ File Integrity Monitor")
+        self.root.geometry("1000x700")
+        self.root.configure(bg='#f0f0f0')
+        
+        # Variables
+        self.selected_algorithm = tk.StringVar(value='sha256')
+        self.monitor_recursive = tk.BooleanVar(value=True)
+        self.auto_check_var = tk.BooleanVar(value=False)
+        self.check_interval = tk.IntVar(value=60)  # seconds
+        
+        self.auto_check_thread = None
+        self.auto_check_running = False
+        
+        self.setup_ui()
+        self.refresh_monitored_files()
+    
+    def setup_ui(self):
+        """Create the user interface"""
+        # Create notebook for tabs
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Monitor tab
+        self.setup_monitor_tab(notebook)
+        
+        # Check tab
+        self.setup_check_tab(notebook)
+        
+        # History tab
+        self.setup_history_tab(notebook)
+        
+        # Settings tab
+        self.setup_settings_tab(notebook)
+    
+    def setup_monitor_tab(self, notebook):
+        """Setup the monitoring tab"""
+        monitor_frame = ttk.Frame(notebook)
+        notebook.add(monitor_frame, text='📁 Monitor Files')
+        
+        # Add files section
+        add_frame = ttk.LabelFrame(monitor_frame, text="Add Files/Directories to Monitor", padding="10")
+        add_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Algorithm selection
+        ttk.Label(add_frame, text="Hash Algorithm:").grid(row=0, column=0, sticky='w')
+        algo_combo = ttk.Combobox(add_frame, textvariable=self.selected_algorithm, 
+                                 values=FileIntegrityMonitor.SUPPORTED_ALGORITHMS, state='readonly')
+        algo_combo.grid(row=0, column=1, padx=10, sticky='w')
+        
+        # Buttons
+        button_frame = ttk.Frame(add_frame)
+        button_frame.grid(row=1, column=0, columnspan=3, pady=10, sticky='w')
+        
+        ttk.Button(button_frame, text="Add File", command=self.add_file).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Add Directory", command=self.add_directory).pack(side='left', padx=5)
+        
+        # Recursive option
+        ttk.Checkbutton(button_frame, text="Recursive", variable=self.monitor_recursive).pack(side='left', padx=10)
+        
+        # Monitored files list
+        list_frame = ttk.LabelFrame(monitor_frame, text="Monitored Files", padding="10")
+        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Treeview for monitored files
+        columns = ('File', 'Size', 'Algorithm', 'Hash', 'Added')
+        self.files_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=15)
+        
+        for col in columns:
+            self.files_tree.heading(col, text=col)
+            if col == 'File':
+                self.files_tree.column(col, width=300)
+            elif col == 'Hash':
+                self.files_tree.column(col, width=200)
+            else:
+                self.files_tree.column(col, width=100)
+        
+        scrollbar_files = ttk.Scrollbar(list_frame, orient='vertical', command=self.files_tree.yview)
+        self.files_tree.configure(yscrollcommand=scrollbar_files.set)
+        
+        self.files_tree.pack(side='left', fill='both', expand=True)
+        scrollbar_files.pack(side='right', fill='y')
+        
+        # Context menu for files list
+        self.setup_files_context_menu()
+        
+        # Control buttons
+        control_frame = ttk.Frame(monitor_frame)
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(control_frame, text="🔄 Refresh List", command=self.refresh_monitored_files).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="❌ Remove Selected", command=self.remove_selected_file).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="🔍 Check Selected", command=self.check_selected_file).pack(side='left', padx=5)
+    
+    def setup_check_tab(self, notebook):
+        """Setup the integrity checking tab"""
+        check_frame = ttk.Frame(notebook)
+        notebook.add(check_frame, text='🔍 Check Integrity')
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(check_frame, text="Integrity Check Controls", padding="10")
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack(fill='x')
+        
+        ttk.Button(button_frame, text="🔍 Check All Files", command=self.check_all_files).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="📊 Generate Report", command=self.generate_report).pack(side='left', padx=5)
+        
+        # Auto-check controls
+        auto_frame = ttk.Frame(control_frame)
+        auto_frame.pack(fill='x', pady=(10, 0))
+        
+        ttk.Checkbutton(auto_frame, text="Auto-check every", variable=self.auto_check_var,
+                       command=self.toggle_auto_check).pack(side='left')
+        ttk.Spinbox(auto_frame, from_=10, to=3600, textvariable=self.check_interval, width=10).pack(side='left', padx=5)
+        ttk.Label(auto_frame, text="seconds").pack(side='left')
+        
+        # Results area
+        results_frame = ttk.LabelFrame(check_frame, text="Check Results", padding="10")
+        results_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.results_text = scrolledtext.ScrolledText(results_frame, height=20, width=100)
+        self.results_text.pack(fill='both', expand=True)
+        
+        # Status bar
+        self.status_label = ttk.Label(check_frame, text="Ready", relief='sunken')
+        self.status_label.pack(fill='x', padx=10, pady=5)
+    
+    def setup_history_tab(self, notebook):
+        """Setup the change history tab"""
+        history_frame = ttk.Frame(notebook)
+        notebook.add(history_frame, text='📜 Change History')
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(history_frame, text="History Controls", padding="10")
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(control_frame, text="🔄 Refresh History", command=self.refresh_history).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="🗑️ Clear History", command=self.clear_history).pack(side='left', padx=5)
+        
+        # History list
+        history_list_frame = ttk.LabelFrame(history_frame, text="Recent Changes", padding="10")
+        history_list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Treeview for history
+        hist_columns = ('Timestamp', 'File', 'Change Type', 'Details')
+        self.history_tree = ttk.Treeview(history_list_frame, columns=hist_columns, show='headings', height=20)
+        
+        for col in hist_columns:
+            self.history_tree.heading(col, text=col)
+            if col == 'File':
+                self.history_tree.column(col, width=300)
+            elif col == 'Details':
+                self.history_tree.column(col, width=200)
+            else:
+                self.history_tree.column(col, width=150)
+        
+        scrollbar_hist = ttk.Scrollbar(history_list_frame, orient='vertical', command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=scrollbar_hist.set)
+        
+        self.history_tree.pack(side='left', fill='both', expand=True)
+        scrollbar_hist.pack(side='right', fill='y')
+    
+    def setup_settings_tab(self, notebook):
+        """Setup the settings tab"""
+        settings_frame = ttk.Frame(notebook)
+        notebook.add(settings_frame, text='⚙️ Settings')
+        
+        # Database info
+        db_frame = ttk.LabelFrame(settings_frame, text="Database Information", padding="10")
+        db_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(db_frame, text=f"Database Location: {self.monitor.db_path}").pack(anchor='w')
+        
+        ttk.Button(db_frame, text="📊 Database Statistics", command=self.show_db_stats).pack(anchor='w', pady=5)
+        
+        # Export/Import
+        export_frame = ttk.LabelFrame(settings_frame, text="Export/Import", padding="10")
+        export_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(export_frame, text="📤 Export Monitored Files", command=self.export_config).pack(side='left', padx=5)
+        ttk.Button(export_frame, text="📥 Import Configuration", command=self.import_config).pack(side='left', padx=5)
+    
+    def setup_files_context_menu(self):
+        """Setup context menu for files tree"""
+        self.files_context_menu = tk.Menu(self.root, tearoff=0)
+        self.files_context_menu.add_command(label="Check Integrity", command=self.check_selected_file)
+        self.files_context_menu.add_command(label="Update Baseline", command=self.update_baseline_selected)
+        self.files_context_menu.add_separator()
+        self.files_context_menu.add_command(label="Remove from Monitoring", command=self.remove_selected_file)
+        self.files_context_menu.add_command(label="Show File Info", command=self.show_file_info)
+        
+        self.files_tree.bind("<Button-3>", self.show_files_context_menu)
+    
+    def show_files_context_menu(self, event):
+        """Show context menu for files tree"""
+        if self.files_tree.selection():
+            self.files_context_menu.post(event.x_root, event.y_root)
+    
+    def add_file(self):
+        """Add a file to monitoring"""
+        file_path = filedialog.askopenfilename(
+            title="Select file to monitor",
+            filetypes=[("All files", "*.*")]
+        )
+        
+        if file_path:
+            try:
+                algorithm = self.selected_algorithm.get()
+                hash_value = self.monitor.add_file_to_monitor(file_path, algorithm)
+                self.log(f"Added file: {os.path.basename(file_path)} ({algorithm}: {hash_value[:16]}...)")
+                self.refresh_monitored_files()
+                messagebox.showinfo("Success", f"File added to monitoring\nHash: {hash_value[:32]}...")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add file: {str(e)}")
+    
+    def add_directory(self):
+        """Add directory to monitoring"""
+        dir_path = filedialog.askdirectory(title="Select directory to monitor")
+        
+        if dir_path:
+            try:
+                algorithm = self.selected_algorithm.get()
+                recursive = self.monitor_recursive.get()
+                
+                # Show progress dialog
+                progress_window = tk.Toplevel(self.root)
+                progress_window.title("Adding Files...")
+                progress_window.geometry("400x150")
+                progress_window.transient(self.root)
+                progress_window.grab_set()
+                
+                progress_label = ttk.Label(progress_window, text="Adding files to monitoring...")
+                progress_label.pack(pady=20)
+                
+                progress_bar = ttk.Progressbar(progress_window, mode='indeterminate')
+                progress_bar.pack(pady=10, padx=20, fill='x')
+                progress_bar.start()
+                
+                def add_directory_thread():
+                    try:
+                        added_files = self.monitor.add_directory_to_monitor(
+                            dir_path, algorithm, recursive
+                        )
+                        
+                        self.root.after(0, lambda: [
+                            progress_window.destroy(),
+                            self.refresh_monitored_files(),
+                            self.log(f"Added {len(added_files)} files from directory: {os.path.basename(dir_path)}"),
+                            messagebox.showinfo("Success", f"Added {len(added_files)} files to monitoring")
+                        ])
+                    except Exception as e:
+                        self.root.after(0, lambda: [
+                            progress_window.destroy(),
+                            messagebox.showerror("Error", f"Failed to add directory: {str(e)}")
+                        ])
+                
+                thread = threading.Thread(target=add_directory_thread)
+                thread.daemon = True
+                thread.start()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add directory: {str(e)}")
+    
+    def refresh_monitored_files(self):
+        """Refresh the monitored files list"""
+        # Clear existing items
+        for item in self.files_tree.get_children():
+            self.files_tree.delete(item)
+        
+        # Get monitored files
+        files = self.monitor.get_monitored_files()
+        
+        for file_info in files:
+            file_path = file_info['file_path']
+            display_path = os.path.basename(file_path) if len(file_path) > 50 else file_path
+            
+            size_str = f"{file_info['file_size']:,} bytes" if file_info['file_size'] else "N/A"
+            hash_display = file_info['hash_value'][:16] + "..." if len(file_info['hash_value']) > 16 else file_info['hash_value']
+            timestamp = file_info['timestamp'].split('T')[0] if 'T' in file_info['timestamp'] else file_info['timestamp']
+            
+            self.files_tree.insert('', 'end', values=(
+                display_path, size_str, file_info['algorithm'], hash_display, timestamp
+            ), tags=(file_path,))
+        
+        self.status_label.configure(text=f"Monitoring {len(files)} files")
+    
+    def remove_selected_file(self):
+        """Remove selected file from monitoring"""
+        selection = self.files_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file to remove")
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        if messagebox.askyesno("Confirm", f"Remove {os.path.basename(file_path)} from monitoring?"):
+            try:
+                self.monitor.remove_from_monitoring(file_path)
+                self.refresh_monitored_files()
+                self.log(f"Removed from monitoring: {os.path.basename(file_path)}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to remove file: {str(e)}")
+    
+    def check_selected_file(self):
+        """Check integrity of selected file"""
+        selection = self.files_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file to check")
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        try:
+            # Get the algorithm used for this file
+            files = self.monitor.get_monitored_files()
+            algorithm = None
+            for f in files:
+                if f['file_path'] == file_path:
+                    algorithm = f['algorithm']
+                    break
+            
+            if not algorithm:
+                messagebox.showerror("Error", "Could not determine hash algorithm for file")
+                return
+            
+            result = self.monitor.check_file_integrity(file_path, algorithm)
+            
+            if result['changed']:
+                if result['change_type'] == 'deleted':
+                    messagebox.showwarning("File Changed", f"File has been DELETED!\n\nFile: {os.path.basename(file_path)}")
+                else:
+                    messagebox.showwarning("File Changed", 
+                        f"File has been MODIFIED!\n\n"
+                        f"File: {os.path.basename(file_path)}\n"
+                        f"Old hash: {result['old_hash'][:32]}...\n"
+                        f"New hash: {result['new_hash'][:32]}...")
+            else:
+                messagebox.showinfo("File Integrity", f"File is UNCHANGED\n\nFile: {os.path.basename(file_path)}\nHash: {result['hash'][:32]}...")
+            
+            self.log(f"Checked: {os.path.basename(file_path)} - {'CHANGED' if result['changed'] else 'OK'}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to check file: {str(e)}")
+    
+    def check_all_files(self):
+        """Check integrity of all monitored files"""
+        def check_thread():
+            try:
+                self.root.after(0, lambda: self.status_label.configure(text="Checking all files..."))
+                results = self.monitor.check_all_monitored_files()
+                
+                changed_files = [r for r in results if r.get('changed') == True]
+                unchanged_files = [r for r in results if r.get('changed') == False]
+                error_files = [r for r in results if 'error' in r]
+                
+                report = f"=== INTEGRITY CHECK REPORT ===\n"
+                report += f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                report += f"Total files checked: {len(results)}\n"
+                report += f"Unchanged files: {len(unchanged_files)}\n"
+                report += f"Changed files: {len(changed_files)}\n"
+                report += f"Error files: {len(error_files)}\n\n"
+                
+                if changed_files:
+                    report += "CHANGED FILES:\n" + "="*50 + "\n"
+                    for r in changed_files:
+                        report += f"📁 {os.path.basename(r['file_path'])}\n"
+                        report += f"   Path: {r['file_path']}\n"
+                        report += f"   Change: {r.get('change_type', 'modified').upper()}\n"
+                        if r.get('old_hash'):
+                            report += f"   Old Hash: {r['old_hash'][:32]}...\n"
+                        if r.get('new_hash'):
+                            report += f"   New Hash: {r['new_hash'][:32]}...\n"
+                        if r.get('old_size') is not None and r.get('new_size') is not None:
+                            report += f"   Size Change: {r['old_size']:,} → {r['new_size']:,} bytes\n"
+                        report += "\n"
+                
+                if error_files:
+                    report += "\nERROR FILES:\n" + "="*50 + "\n"
+                    for r in error_files:
+                        report += f"❌ {os.path.basename(r['file_path'])}\n"
+                        report += f"   Path: {r['file_path']}\n"
+                        report += f"   Error: {r['error']}\n\n"
+                
+                if unchanged_files:
+                    report += f"\nUNCHANGED FILES ({len(unchanged_files)}):\n" + "="*50 + "\n"
+                    for r in unchanged_files[:10]:  # Show first 10
+                        report += f"✅ {os.path.basename(r['file_path'])}\n"
+                    if len(unchanged_files) > 10:
+                        report += f"... and {len(unchanged_files) - 10} more unchanged files\n"
+                
+                self.root.after(0, lambda: [
+                    self.results_text.delete(1.0, tk.END),
+                    self.results_text.insert(tk.END, report),
+                    self.status_label.configure(text=f"Check complete: {len(changed_files)} changed, {len(unchanged_files)} OK"),
+                    self.log(f"Integrity check complete: {len(changed_files)} changed files found")
+                ])
+                
+                if changed_files:
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "Changes Detected", 
+                        f"Found {len(changed_files)} changed files!\nSee results tab for details."
+                    ))
+                
+            except Exception as e:
+                self.root.after(0, lambda: [
+                    messagebox.showerror("Error", f"Check failed: {str(e)}"),
+                    self.status_label.configure(text="Check failed")
+                ])
+        
+        thread = threading.Thread(target=check_thread)
+        thread.daemon = True
+        thread.start()
+    
+    def generate_report(self):
+        """Generate and save integrity report"""
+        try:
+            results = self.monitor.check_all_monitored_files()
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"integrity_report_{timestamp}.txt"
+            
+            filepath = filedialog.asksaveasfilename(
+                title="Save Integrity Report",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                initialname=filename
+            )
+            
+            if filepath:
+                with open(filepath, 'w') as f:
+                    f.write(self.results_text.get(1.0, tk.END))
+                
+                messagebox.showinfo("Report Saved", f"Integrity report saved to:\n{filepath}")
+                self.log(f"Report saved: {os.path.basename(filepath)}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate report: {str(e)}")
+    
+    def toggle_auto_check(self):
+        """Toggle automatic checking"""
+        if self.auto_check_var.get():
+            self.start_auto_check()
+        else:
+            self.stop_auto_check()
+    
+    def start_auto_check(self):
+        """Start automatic checking"""
+        if not self.auto_check_running:
+            self.auto_check_running = True
+            self.auto_check_thread = threading.Thread(target=self.auto_check_worker)
+            self.auto_check_thread.daemon = True
+            self.auto_check_thread.start()
+            self.log(f"Auto-check started (interval: {self.check_interval.get()}s)")
+    
+    def stop_auto_check(self):
+        """Stop automatic checking"""
+        self.auto_check_running = False
+        if self.auto_check_thread:
+            self.auto_check_thread = None
+        self.log("Auto-check stopped")
+    
+    def auto_check_worker(self):
+        """Auto-check worker thread"""
+        while self.auto_check_running and self.auto_check_var.get():
+            try:
+                results = self.monitor.check_all_monitored_files()
+                changed_files = [r for r in results if r.get('changed') == True]
+                
+                if changed_files:
+                    self.root.after(0, lambda: [
+                        self.log(f"Auto-check: {len(changed_files)} files changed!"),
+                        messagebox.showwarning("Auto-Check Alert", 
+                            f"Detected {len(changed_files)} changed files!\n"
+                            "Check the results tab for details.")
+                    ])
+                else:
+                    self.root.after(0, lambda: self.log("Auto-check: All files OK"))
+                
+                time.sleep(self.check_interval.get())
+                
+            except Exception as e:
+                self.root.after(0, lambda: self.log(f"Auto-check error: {str(e)}"))
+                time.sleep(10)  # Wait before retrying
+    
+    def refresh_history(self):
+        """Refresh change history"""
+        # Clear existing items
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        
+        # Get history
+        history = self.monitor.get_change_history()
+        
+        for change in history:
+            timestamp = change['timestamp'].split('T')[0] + ' ' + change['timestamp'].split('T')[1][:8]
+            file_name = os.path.basename(change['file_path'])
+            change_type = change['change_type'].upper()
+            
+            details = ""
+            if change['change_type'] == 'modified':
+                if change['old_size'] and change['new_size']:
+                    size_change = f"{change['old_size']:,} → {change['new_size']:,} bytes"
+                    details = f"Size: {size_change}"
+            elif change['change_type'] == 'deleted':
+                details = "File deleted"
+            
+            self.history_tree.insert('', 'end', values=(
+                timestamp, file_name, change_type, details
+            ))
+    
+    def clear_history(self):
+        """Clear change history"""
+        if messagebox.askyesno("Confirm", "Clear all change history?"):
+            try:
+                conn = sqlite3.connect(self.monitor.db_path)
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM change_log')
+                conn.commit()
+                conn.close()
+                
+                self.refresh_history()
+                self.log("Change history cleared")
+                messagebox.showinfo("Success", "Change history cleared")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to clear history: {str(e)}")
+    
+    def update_baseline_selected(self):
+        """Update baseline for selected file"""
+        selection = self.files_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file")
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        if messagebox.askyesno("Confirm", f"Update baseline hash for {os.path.basename(file_path)}?"):
+            try:
+                # Get current algorithm
+                files = self.monitor.get_monitored_files()
+                algorithm = None
+                for f in files:
+                    if f['file_path'] == file_path:
+                        algorithm = f['algorithm']
+                        break
+                
+                self.monitor.update_baseline(file_path, algorithm)
+                self.refresh_monitored_files()
+                self.log(f"Updated baseline: {os.path.basename(file_path)}")
+                messagebox.showinfo("Success", "Baseline updated")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update baseline: {str(e)}")
+    
+    def show_file_info(self):
+        """Show detailed info about selected file"""
+        selection = self.files_tree.selection()
+        if not selection:
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        try:
+            # Get file info from database
+            files = self.monitor.get_monitored_files()
+            file_info = None
+            for f in files:
+                if f['file_path'] == file_path:
+                    file_info = f
+                    break
+            
+            if not file_info:
+                return
+            
+            # Get current file status
+            current_info = self.monitor.get_file_info(file_path)
+            
+            info_window = tk.Toplevel(self.root)
+            info_window.title(f"File Info - {os.path.basename(file_path)}")
+            info_window.geometry("500x400")
+            info_window.transient(self.root)
+            
+            info_text = scrolledtext.ScrolledText(info_window, height=20, width=60)
+            info_text.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            info = f"FILE INFORMATION\n{'='*50}\n\n"
+            info += f"File Path: {file_path}\n"
+            info += f"File Name: {os.path.basename(file_path)}\n"
+            info += f"Directory: {os.path.dirname(file_path)}\n\n"
+            
+            info += f"MONITORING INFO\n{'='*50}\n"
+            info += f"Hash Algorithm: {file_info['algorithm']}\n"
+            info += f"Stored Hash: {file_info['hash_value']}\n"
+            info += f"Stored Size: {file_info['file_size']:,} bytes\n"
+            info += f"Added to Monitor: {file_info['timestamp']}\n"
+            info += f"Status: {file_info['status']}\n\n"
+            
+            if current_info['exists']:
+                info += f"CURRENT STATUS\n{'='*50}\n"
+                info += f"Current Size: {current_info['size']:,} bytes\n"
+                info += f"Last Modified: {datetime.fromtimestamp(current_info['mtime']).isoformat()}\n"
+                
+                # Check if changed
+                try:
+                    result = self.monitor.check_file_integrity(file_path, file_info['algorithm'])
+                    if result['changed']:
+                        info += f"⚠️  FILE HAS CHANGED!\n"
+                        info += f"Change Type: {result.get('change_type', 'unknown')}\n"
+                        if result.get('new_hash'):
+                            info += f"Current Hash: {result['new_hash']}\n"
+                    else:
+                        info += f"✅ File is unchanged\n"
+                except:
+                    info += f"❓ Unable to check current status\n"
+            else:
+                info += f"CURRENT STATUS\n{'='*50}\n"
+                info += f"❌ FILE NOT FOUND\n"
+            
+            info_text.insert(tk.END, info)
+            info_text.configure(state='disabled')
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get file info: {str(e)}")
+    
+    def show_db_stats(self):
+        """Show database statistics"""
+        try:
+            conn = sqlite3.connect(self.monitor.db_path)
+            cursor = conn.cursor()
+            
+            # Get statistics
+            cursor.execute('SELECT COUNT(*) FROM file_hashes')
+            total_files = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM change_log')
+            total_changes = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT hash_algorithm, COUNT(*) FROM file_hashes GROUP BY hash_algorithm')
+            algo_stats = cursor.fetchall()
+            
+            cursor.execute('SELECT change_type, COUNT(*) FROM change_log GROUP BY change_type')
+            change_stats = cursor.fetchall()
+            
+            conn.close()
+            
+            # Show stats window
+            stats_window = tk.Toplevel(self.root)
+            stats_window.title("Database Statistics")
+            stats_window.geometry("400x300")
+            stats_window.transient(self.root)
+            
+            stats_text = scrolledtext.ScrolledText(stats_window, height=15, width=50)
+            stats_text.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            stats = f"DATABASE STATISTICS\n{'='*30}\n\n"
+            stats += f"Database File: {self.monitor.db_path}\n"
+            stats += f"Total Monitored Files: {total_files}\n"
+            stats += f"Total Recorded Changes: {total_changes}\n\n"
+            
+            if algo_stats:
+                stats += f"FILES BY ALGORITHM:\n{'-'*20}\n"
+                for algo, count in algo_stats:
+                    stats += f"{algo.upper()}: {count} files\n"
+                stats += "\n"
+            
+            if change_stats:
+                stats += f"CHANGES BY TYPE:\n{'-'*20}\n"
+                for change_type, count in change_stats:
+                    stats += f"{change_type.upper()}: {count} changes\n"
+            
+            stats_text.insert(tk.END, stats)
+            stats_text.configure(state='disabled')
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get statistics: {str(e)}")
+    
+    def export_config(self):
+        """Export monitored files configuration"""
+        try:
+            files = self.monitor.get_monitored_files()
+            
+            config = {
+                'export_timestamp': datetime.now().isoformat(),
+                'files': files
+            }
+            
+            filepath = filedialog.asksaveasfilename(
+                title="Export Configuration",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialname=f"file_monitor_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            
+            if filepath:
+                with open(filepath, 'w') as f:
+                    json.dump(config, f, indent=2)
+                
+                messagebox.showinfo("Export Complete", f"Configuration exported to:\n{filepath}")
+                self.log(f"Configuration exported: {os.path.basename(filepath)}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export configuration: {str(e)}")
+    
+    def import_config(self):
+        """Import monitored files configuration"""
+        filepath = filedialog.askopenfilename(
+            title="Import Configuration",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if filepath:
+            try:
+                with open(filepath, 'r') as f:
+                    config = json.load(f)
+                
+                if 'files' not in config:
+                    messagebox.showerror("Error", "Invalid configuration file format")
+                    return
+                
+                files = config['files']
+                imported_count = 0
+                
+                for file_info in files:
+                    try:
+                        file_path = file_info['file_path']
+                        if os.path.exists(file_path):
+                            self.monitor.add_file_to_monitor(file_path, file_info['algorithm'])
+                            imported_count += 1
+                    except Exception as e:
+                        print(f"Warning: Could not import {file_info.get('file_path', 'unknown')}: {e}")
+                
+                self.refresh_monitored_files()
+                messagebox.showinfo("Import Complete", 
+                    f"Imported {imported_count} files from configuration\n"
+                    f"Total files in config: {len(files)}")
+                self.log(f"Configuration imported: {imported_count} files added")
+            
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to import configuration: {str(e)}")
+    
+    def log(self, message):
+        """Add message to results log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_message = f"[{timestamp}] {message}\n"
+        
+        current_text = self.results_text.get(1.0, tk.END)
+        if len(current_text) > 10000:  # Keep log size manageable
+            self.results_text.delete(1.0, "5.0")
+        
+        self.results_text.insert(tk.END, log_message)
+        self.results_text.see(tk.END)
+        self.root.update_idletasks()
+
+
+def main():
+    """Main function - can be used for both GUI and CLI"""
+    parser = argparse.ArgumentParser(description='File Integrity Monitoring Tool')
+    parser.add_argument('--cli', action='store_true', help='Use command line interface')
+    parser.add_argument('--add-file', help='Add file to monitoring')
+    parser.add_argument('--add-dir', help='Add directory to monitoring')
+    parser.add_argument('--check', help='Check specific file integrity')
+    parser.add_argument('--check-all', action='store_true', help='Check all monitored files')
+    parser.add_argument('--list', action='store_true', help='List monitored files')
+    parser.add_argument('--remove', help='Remove file from monitoring')
+    parser.add_argument('--algorithm', default='sha256', choices=FileIntegrityMonitor.SUPPORTED_ALGORITHMS,
+                       help='Hash algorithm to use')
+    parser.add_argument('--recursive', action='store_true', help='Add directory recursively')
+    parser.add_argument('--db', default='file_integrity.db', help='Database file path')
+    
+    args = parser.parse_args()
+    
+    if args.cli or any([args.add_file, args.add_dir, args.check, args.check_all, args.list, args.remove]):
+        # Command line interface
+        monitor = FileIntegrityMonitor(args.db)
+        
+        try:
+            if args.add_file:
+                hash_value = monitor.add_file_to_monitor(args.add_file, args.algorithm)
+                print(f"✅ Added file: {args.add_file}")
+                print(f"   Hash ({args.algorithm}): {hash_value}")
+            
+            elif args.add_dir:
+                files = monitor.add_directory_to_monitor(args.add_dir, args.algorithm, args.recursive)
+                print(f"✅ Added {len(files)} files from directory: {args.add_dir}")
+            
+            elif args.check:
+                result = monitor.check_file_integrity(args.check, args.algorithm)
+                if result['changed']:
+                    print(f"⚠️  File CHANGED: {args.check}")
+                    print(f"   Change type: {result.get('change_type', 'modified')}")
+                    if result.get('old_hash') and result.get('new_hash'):
+                        print(f"   Old hash: {result['old_hash']}")
+                        print(f"   New hash: {result['new_hash']}")
+                else:
+                    print(f"✅ File OK: {args.check}")
+                    print(f"   Hash: {result['hash']}")
+            
+            elif args.check_all:
+                results = monitor.check_all_monitored_files()
+                changed = [r for r in results if r.get('changed') == True]
+                unchanged = [r for r in results if r.get('changed') == False]
+                errors = [r for r in results if 'error' in r]
+                
+                print(f"\n📊 INTEGRITY CHECK RESULTS")
+                print(f"{'='*40}")
+                print(f"Total files: {len(results)}")
+                print(f"✅ Unchanged: {len(unchanged)}")
+                print(f"⚠️  Changed: {len(changed)}")
+                print(f"❌ Errors: {len(errors)}")
+                
+                if changed:
+                    print(f"\nCHANGED FILES:")
+                    for r in changed:
+                        print(f"  ⚠️  {r['file_path']} ({r.get('change_type', 'modified')})")
+                
+                if errors:
+                    print(f"\nERROR FILES:")
+                    for r in errors:
+                        print(f"  ❌ {r['file_path']}: {r['error']}")
+            
+            elif args.list:
+                files = monitor.get_monitored_files()
+                print(f"\n📁 MONITORED FILES ({len(files)})")
+                print(f"{'='*60}")
+                for f in files:
+                    print(f"📄 {f['file_path']}")
+                    print(f"   Algorithm: {f['algorithm']}")
+                    print(f"   Size: {f['file_size']:,} bytes")
+                    print(f"   Hash: {f['hash_value'][:32]}...")
+                    print(f"   Added: {f['timestamp']}")
+                    print()
+            
+            elif args.remove:
+                if monitor.remove_from_monitoring(args.remove):
+                    print(f"✅ Removed from monitoring: {args.remove}")
+                else:
+                    print(f"❌ File not found in monitoring: {args.remove}")
+        
+        except Exception as e:
+            print(f"❌ Error: {str(e)}")
+            sys.exit(1)
+    
+    else:
+        # GUI interface
+        root = tk.Tk()
+        app = FileIntegrityGUI(root)
+        root.mainloop()
+
+
+if __name__ == "__main__":
+    main()#!/usr/bin/env python3
+"""
+File Integrity Monitoring Tool
+A comprehensive tool to monitor file changes using hash calculations.
+Supports multiple hash algorithms and provides both GUI and CLI interfaces.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import os
+import sys
+import json
+import hashlib
+import time
+import threading
+from pathlib import Path
+import argparse
+from datetime import datetime
+import sqlite3
+from collections import defaultdict
+import fnmatch
+
+class FileIntegrityMonitor:
+    """Core file integrity monitoring functionality"""
+    
+    SUPPORTED_ALGORITHMS = ['md5', 'sha1', 'sha256', 'sha512', 'blake2b']
+    
+    def __init__(self, db_path="file_integrity.db"):
+        self.db_path = db_path
+        self.init_database()
+        
+    def init_database(self):
+        """Initialize SQLite database for storing hash records"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                file_size INTEGER,
+                hash_algorithm TEXT NOT NULL,
+                hash_value TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                status TEXT DEFAULT 'monitored',
+                UNIQUE(file_path, hash_algorithm)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                old_hash TEXT,
+                new_hash TEXT,
+                old_size INTEGER,
+                new_size INTEGER,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def calculate_hash(self, file_path, algorithm='sha256', chunk_size=8192):
+        """Calculate hash of a file using specified algorithm"""
+        if algorithm not in self.SUPPORTED_ALGORITHMS:
+            raise ValueError(f"Unsupported algorithm: {algorithm}")
+        
+        hasher = hashlib.new(algorithm)
+        
+        try:
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(chunk_size):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            raise Exception(f"Error calculating hash for {file_path}: {str(e)}")
+    
+    def get_file_info(self, file_path):
+        """Get file information including size and modification time"""
+        try:
+            stat = os.stat(file_path)
+            return {
+                'size': stat.st_size,
+                'mtime': stat.st_mtime,
+                'exists': True
+            }
+        except FileNotFoundError:
+            return {'exists': False}
+        except Exception as e:
+            raise Exception(f"Error accessing file {file_path}: {str(e)}")
+    
+    def add_file_to_monitor(self, file_path, algorithm='sha256'):
+        """Add a file to the monitoring database"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        file_path = os.path.abspath(file_path)
+        file_info = self.get_file_info(file_path)
+        hash_value = self.calculate_hash(file_path, algorithm)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO file_hashes 
+            (file_path, file_size, hash_algorithm, hash_value, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (file_path, file_info['size'], algorithm, hash_value, 
+              datetime.now().isoformat(), 'monitored'))
+        
+        conn.commit()
+        conn.close()
+        
+        return hash_value
+    
+    def add_directory_to_monitor(self, dir_path, algorithm='sha256', recursive=True, 
+                               include_patterns=None, exclude_patterns=None):
+        """Add all files in a directory to monitoring"""
+        if not os.path.isdir(dir_path):
+            raise NotADirectoryError(f"Directory not found: {dir_path}")
+        
+        added_files = []
+        include_patterns = include_patterns or ['*']
+        exclude_patterns = exclude_patterns or []
+        
+        def should_include_file(filepath):
+            filename = os.path.basename(filepath)
+            
+            # Check include patterns
+            if not any(fnmatch.fnmatch(filename, pattern) for pattern in include_patterns):
+                return False
+            
+            # Check exclude patterns
+            if any(fnmatch.fnmatch(filename, pattern) for pattern in exclude_patterns):
+                return False
+            
+            return True
+        
+        if recursive:
+            for root, dirs, files in os.walk(dir_path):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    if should_include_file(filepath):
+                        try:
+                            self.add_file_to_monitor(filepath, algorithm)
+                            added_files.append(filepath)
+                        except Exception as e:
+                            print(f"Warning: Could not add {filepath}: {e}")
+        else:
+            for item in os.listdir(dir_path):
+                filepath = os.path.join(dir_path, item)
+                if os.path.isfile(filepath) and should_include_file(filepath):
+                    try:
+                        self.add_file_to_monitor(filepath, algorithm)
+                        added_files.append(filepath)
+                    except Exception as e:
+                        print(f"Warning: Could not add {filepath}: {e}")
+        
+        return added_files
+    
+    def check_file_integrity(self, file_path, algorithm='sha256'):
+        """Check if a monitored file has been modified"""
+        file_path = os.path.abspath(file_path)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT hash_value, file_size, timestamp FROM file_hashes 
+            WHERE file_path = ? AND hash_algorithm = ?
+        ''', (file_path, algorithm))
+        
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            raise ValueError(f"File {file_path} is not being monitored with {algorithm}")
+        
+        stored_hash, stored_size, stored_timestamp = result
+        
+        # Check if file still exists
+        if not os.path.exists(file_path):
+            # Log file deletion
+            cursor.execute('''
+                INSERT INTO change_log 
+                (file_path, change_type, old_hash, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (file_path, 'deleted', stored_hash, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            
+            return {
+                'changed': True,
+                'change_type': 'deleted',
+                'old_hash': stored_hash,
+                'stored_size': stored_size,
+                'stored_timestamp': stored_timestamp
+            }
+        
+        # Calculate current hash
+        current_info = self.get_file_info(file_path)
+        current_hash = self.calculate_hash(file_path, algorithm)
+        
+        if current_hash != stored_hash:
+            # Log file modification
+            cursor.execute('''
+                INSERT INTO change_log 
+                (file_path, change_type, old_hash, new_hash, old_size, new_size, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (file_path, 'modified', stored_hash, current_hash, 
+                  stored_size, current_info['size'], datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            
+            return {
+                'changed': True,
+                'change_type': 'modified',
+                'old_hash': stored_hash,
+                'new_hash': current_hash,
+                'old_size': stored_size,
+                'new_size': current_info['size'],
+                'stored_timestamp': stored_timestamp
+            }
+        
+        conn.close()
+        return {'changed': False, 'hash': current_hash}
+    
+    def check_all_monitored_files(self, algorithm=None):
+        """Check integrity of all monitored files"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if algorithm:
+            cursor.execute('SELECT DISTINCT file_path, hash_algorithm FROM file_hashes WHERE hash_algorithm = ?', (algorithm,))
+        else:
+            cursor.execute('SELECT DISTINCT file_path, hash_algorithm FROM file_hashes')
+        
+        files = cursor.fetchall()
+        conn.close()
+        
+        results = []
+        for file_path, hash_algo in files:
+            try:
+                result = self.check_file_integrity(file_path, hash_algo)
+                result['file_path'] = file_path
+                result['algorithm'] = hash_algo
+                results.append(result)
+            except Exception as e:
+                results.append({
+                    'file_path': file_path,
+                    'algorithm': hash_algo,
+                    'error': str(e),
+                    'changed': None
+                })
+        
+        return results
+    
+    def get_monitored_files(self):
+        """Get list of all monitored files"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT file_path, file_size, hash_algorithm, hash_value, timestamp, status
+            FROM file_hashes ORDER BY file_path
+        ''')
+        
+        files = cursor.fetchall()
+        conn.close()
+        
+        return [{'file_path': f[0], 'file_size': f[1], 'algorithm': f[2], 
+                'hash_value': f[3], 'timestamp': f[4], 'status': f[5]} for f in files]
+    
+    def get_change_history(self, file_path=None, limit=100):
+        """Get change history"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if file_path:
+            cursor.execute('''
+                SELECT file_path, change_type, old_hash, new_hash, old_size, new_size, timestamp
+                FROM change_log WHERE file_path = ? ORDER BY timestamp DESC LIMIT ?
+            ''', (file_path, limit))
+        else:
+            cursor.execute('''
+                SELECT file_path, change_type, old_hash, new_hash, old_size, new_size, timestamp
+                FROM change_log ORDER BY timestamp DESC LIMIT ?
+            ''', (limit,))
+        
+        changes = cursor.fetchall()
+        conn.close()
+        
+        return [{'file_path': c[0], 'change_type': c[1], 'old_hash': c[2], 
+                'new_hash': c[3], 'old_size': c[4], 'new_size': c[5], 
+                'timestamp': c[6]} for c in changes]
+    
+    def remove_from_monitoring(self, file_path):
+        """Remove a file from monitoring"""
+        file_path = os.path.abspath(file_path)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('DELETE FROM file_hashes WHERE file_path = ?', (file_path,))
+        rows_affected = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        return rows_affected > 0
+    
+    def update_baseline(self, file_path, algorithm='sha256'):
+        """Update the baseline hash for a file"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        self.add_file_to_monitor(file_path, algorithm)  # This will replace existing entry
+        return True
+
+
+class FileIntegrityGUI:
+    """GUI interface for the file integrity monitor"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.monitor = FileIntegrityMonitor()
+        self.root.title("🛡️ File Integrity Monitor")
+        self.root.geometry("1000x700")
+        self.root.configure(bg='#f0f0f0')
+        
+        # Variables
+        self.selected_algorithm = tk.StringVar(value='sha256')
+        self.monitor_recursive = tk.BooleanVar(value=True)
+        self.auto_check_var = tk.BooleanVar(value=False)
+        self.check_interval = tk.IntVar(value=60)  # seconds
+        
+        self.auto_check_thread = None
+        self.auto_check_running = False
+        
+        self.setup_ui()
+        self.refresh_monitored_files()
+    
+    def setup_ui(self):
+        """Create the user interface"""
+        # Create notebook for tabs
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Monitor tab
+        self.setup_monitor_tab(notebook)
+        
+        # Check tab
+        self.setup_check_tab(notebook)
+        
+        # History tab
+        self.setup_history_tab(notebook)
+        
+        # Settings tab
+        self.setup_settings_tab(notebook)
+    
+    def setup_monitor_tab(self, notebook):
+        """Setup the monitoring tab"""
+        monitor_frame = ttk.Frame(notebook)
+        notebook.add(monitor_frame, text='📁 Monitor Files')
+        
+        # Add files section
+        add_frame = ttk.LabelFrame(monitor_frame, text="Add Files/Directories to Monitor", padding="10")
+        add_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Algorithm selection
+        ttk.Label(add_frame, text="Hash Algorithm:").grid(row=0, column=0, sticky='w')
+        algo_combo = ttk.Combobox(add_frame, textvariable=self.selected_algorithm, 
+                                 values=FileIntegrityMonitor.SUPPORTED_ALGORITHMS, state='readonly')
+        algo_combo.grid(row=0, column=1, padx=10, sticky='w')
+        
+        # Buttons
+        button_frame = ttk.Frame(add_frame)
+        button_frame.grid(row=1, column=0, columnspan=3, pady=10, sticky='w')
+        
+        ttk.Button(button_frame, text="Add File", command=self.add_file).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Add Directory", command=self.add_directory).pack(side='left', padx=5)
+        
+        # Recursive option
+        ttk.Checkbutton(button_frame, text="Recursive", variable=self.monitor_recursive).pack(side='left', padx=10)
+        
+        # Monitored files list
+        list_frame = ttk.LabelFrame(monitor_frame, text="Monitored Files", padding="10")
+        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Treeview for monitored files
+        columns = ('File', 'Size', 'Algorithm', 'Hash', 'Added')
+        self.files_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=15)
+        
+        for col in columns:
+            self.files_tree.heading(col, text=col)
+            if col == 'File':
+                self.files_tree.column(col, width=300)
+            elif col == 'Hash':
+                self.files_tree.column(col, width=200)
+            else:
+                self.files_tree.column(col, width=100)
+        
+        scrollbar_files = ttk.Scrollbar(list_frame, orient='vertical', command=self.files_tree.yview)
+        self.files_tree.configure(yscrollcommand=scrollbar_files.set)
+        
+        self.files_tree.pack(side='left', fill='both', expand=True)
+        scrollbar_files.pack(side='right', fill='y')
+        
+        # Context menu for files list
+        self.setup_files_context_menu()
+        
+        # Control buttons
+        control_frame = ttk.Frame(monitor_frame)
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(control_frame, text="🔄 Refresh List", command=self.refresh_monitored_files).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="❌ Remove Selected", command=self.remove_selected_file).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="🔍 Check Selected", command=self.check_selected_file).pack(side='left', padx=5)
+    
+    def setup_check_tab(self, notebook):
+        """Setup the integrity checking tab"""
+        check_frame = ttk.Frame(notebook)
+        notebook.add(check_frame, text='🔍 Check Integrity')
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(check_frame, text="Integrity Check Controls", padding="10")
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack(fill='x')
+        
+        ttk.Button(button_frame, text="🔍 Check All Files", command=self.check_all_files).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="📊 Generate Report", command=self.generate_report).pack(side='left', padx=5)
+        
+        # Auto-check controls
+        auto_frame = ttk.Frame(control_frame)
+        auto_frame.pack(fill='x', pady=(10, 0))
+        
+        ttk.Checkbutton(auto_frame, text="Auto-check every", variable=self.auto_check_var,
+                       command=self.toggle_auto_check).pack(side='left')
+        ttk.Spinbox(auto_frame, from_=10, to=3600, textvariable=self.check_interval, width=10).pack(side='left', padx=5)
+        ttk.Label(auto_frame, text="seconds").pack(side='left')
+        
+        # Results area
+        results_frame = ttk.LabelFrame(check_frame, text="Check Results", padding="10")
+        results_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.results_text = scrolledtext.ScrolledText(results_frame, height=20, width=100)
+        self.results_text.pack(fill='both', expand=True)
+        
+        # Status bar
+        self.status_label = ttk.Label(check_frame, text="Ready", relief='sunken')
+        self.status_label.pack(fill='x', padx=10, pady=5)
+    
+    def setup_history_tab(self, notebook):
+        """Setup the change history tab"""
+        history_frame = ttk.Frame(notebook)
+        notebook.add(history_frame, text='📜 Change History')
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(history_frame, text="History Controls", padding="10")
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(control_frame, text="🔄 Refresh History", command=self.refresh_history).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="🗑️ Clear History", command=self.clear_history).pack(side='left', padx=5)
+        
+        # History list
+        history_list_frame = ttk.LabelFrame(history_frame, text="Recent Changes", padding="10")
+        history_list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Treeview for history
+        hist_columns = ('Timestamp', 'File', 'Change Type', 'Details')
+        self.history_tree = ttk.Treeview(history_list_frame, columns=hist_columns, show='headings', height=20)
+        
+        for col in hist_columns:
+            self.history_tree.heading(col, text=col)
+            if col == 'File':
+                self.history_tree.column(col, width=300)
+            elif col == 'Details':
+                self.history_tree.column(col, width=200)
+            else:
+                self.history_tree.column(col, width=150)
+        
+        scrollbar_hist = ttk.Scrollbar(history_list_frame, orient='vertical', command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=scrollbar_hist.set)
+        
+        self.history_tree.pack(side='left', fill='both', expand=True)
+        scrollbar_hist.pack(side='right', fill='y')
+    
+    def setup_settings_tab(self, notebook):
+        """Setup the settings tab"""
+        settings_frame = ttk.Frame(notebook)
+        notebook.add(settings_frame, text='⚙️ Settings')
+        
+        # Database info
+        db_frame = ttk.LabelFrame(settings_frame, text="Database Information", padding="10")
+        db_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(db_frame, text=f"Database Location: {self.monitor.db_path}").pack(anchor='w')
+        
+        ttk.Button(db_frame, text="📊 Database Statistics", command=self.show_db_stats).pack(anchor='w', pady=5)
+        
+        # Export/Import
+        export_frame = ttk.LabelFrame(settings_frame, text="Export/Import", padding="10")
+        export_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(export_frame, text="📤 Export Monitored Files", command=self.export_config).pack(side='left', padx=5)
+        ttk.Button(export_frame, text="📥 Import Configuration", command=self.import_config).pack(side='left', padx=5)
+    
+    def setup_files_context_menu(self):
+        """Setup context menu for files tree"""
+        self.files_context_menu = tk.Menu(self.root, tearoff=0)
+        self.files_context_menu.add_command(label="Check Integrity", command=self.check_selected_file)
+        self.files_context_menu.add_command(label="Update Baseline", command=self.update_baseline_selected)
+        self.files_context_menu.add_separator()
+        self.files_context_menu.add_command(label="Remove from Monitoring", command=self.remove_selected_file)
+        self.files_context_menu.add_command(label="Show File Info", command=self.show_file_info)
+        
+        self.files_tree.bind("<Button-3>", self.show_files_context_menu)
+    
+    def show_files_context_menu(self, event):
+        """Show context menu for files tree"""
+        if self.files_tree.selection():
+            self.files_context_menu.post(event.x_root, event.y_root)
+    
+    def add_file(self):
+        """Add a file to monitoring"""
+        file_path = filedialog.askopenfilename(
+            title="Select file to monitor",
+            filetypes=[("All files", "*.*")]
+        )
+        
+        if file_path:
+            try:
+                algorithm = self.selected_algorithm.get()
+                hash_value = self.monitor.add_file_to_monitor(file_path, algorithm)
+                self.log(f"Added file: {os.path.basename(file_path)} ({algorithm}: {hash_value[:16]}...)")
+                self.refresh_monitored_files()
+                messagebox.showinfo("Success", f"File added to monitoring\nHash: {hash_value[:32]}...")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add file: {str(e)}")
+    
+    def add_directory(self):
+        """Add directory to monitoring"""
+        dir_path = filedialog.askdirectory(title="Select directory to monitor")
+        
+        if dir_path:
+            try:
+                algorithm = self.selected_algorithm.get()
+                recursive = self.monitor_recursive.get()
+                
+                # Show progress dialog
+                progress_window = tk.Toplevel(self.root)
+                progress_window.title("Adding Files...")
+                progress_window.geometry("400x150")
+                progress_window.transient(self.root)
+                progress_window.grab_set()
+                
+                progress_label = ttk.Label(progress_window, text="Adding files to monitoring...")
+                progress_label.pack(pady=20)
+                
+                progress_bar = ttk.Progressbar(progress_window, mode='indeterminate')
+                progress_bar.pack(pady=10, padx=20, fill='x')
+                progress_bar.start()
+                
+                def add_directory_thread():
+                    try:
+                        added_files = self.monitor.add_directory_to_monitor(
+                            dir_path, algorithm, recursive
+                        )
+                        
+                        self.root.after(0, lambda: [
+                            progress_window.destroy(),
+                            self.refresh_monitored_files(),
+                            self.log(f"Added {len(added_files)} files from directory: {os.path.basename(dir_path)}"),
+                            messagebox.showinfo("Success", f"Added {len(added_files)} files to monitoring")
+                        ])
+                    except Exception as e:
+                        self.root.after(0, lambda: [
+                            progress_window.destroy(),
+                            messagebox.showerror("Error", f"Failed to add directory: {str(e)}")
+                        ])
+                
+                thread = threading.Thread(target=add_directory_thread)
+                thread.daemon = True
+                thread.start()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add directory: {str(e)}")
+    
+    def refresh_monitored_files(self):
+        """Refresh the monitored files list"""
+        # Clear existing items
+        for item in self.files_tree.get_children():
+            self.files_tree.delete(item)
+        
+        # Get monitored files
+        files = self.monitor.get_monitored_files()
+        
+        for file_info in files:
+            file_path = file_info['file_path']
+            display_path = os.path.basename(file_path) if len(file_path) > 50 else file_path
+            
+            size_str = f"{file_info['file_size']:,} bytes" if file_info['file_size'] else "N/A"
+            hash_display = file_info['hash_value'][:16] + "..." if len(file_info['hash_value']) > 16 else file_info['hash_value']
+            timestamp = file_info['timestamp'].split('T')[0] if 'T' in file_info['timestamp'] else file_info['timestamp']
+            
+            self.files_tree.insert('', 'end', values=(
+                display_path, size_str, file_info['algorithm'], hash_display, timestamp
+            ), tags=(file_path,))
+        
+        self.status_label.configure(text=f"Monitoring {len(files)} files")
+    
+    def remove_selected_file(self):
+        """Remove selected file from monitoring"""
+        selection = self.files_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file to remove")
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        if messagebox.askyesno("Confirm", f"Remove {os.path.basename(file_path)} from monitoring?"):
+            try:
+                self.monitor.remove_from_monitoring(file_path)
+                self.refresh_monitored_files()
+                self.log(f"Removed from monitoring: {os.path.basename(file_path)}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to remove file: {str(e)}")
+    
+    def check_selected_file(self):
+        """Check integrity of selected file"""
+        selection = self.files_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file to check")
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        try:
+            # Get the algorithm used for this file
+            files = self.monitor.get_monitored_files()
+            algorithm = None
+            for f in files:
+                if f['file_path'] == file_path:
+                    algorithm = f['algorithm']
+                    break
+            
+            if not algorithm:
+                messagebox.showerror("Error", "Could not determine hash algorithm for file")
+                return
+            
+            result = self.monitor.check_file_integrity(file_path, algorithm)
+            
+            if result['changed']:
+                if result['change_type'] == 'deleted':
+                    messagebox.showwarning("File Changed", f"File has been DELETED!\n\nFile: {os.path.basename(file_path)}")
+                else:
+                    messagebox.showwarning("File Changed", 
+                        f"File has been MODIFIED!\n\n"
+                        f"File: {os.path.basename(file_path)}\n"
+                        f"Old hash: {result['old_hash'][:32]}...\n"
+                        f"New hash: {result['new_hash'][:32]}...")
+            else:
+                messagebox.showinfo("File Integrity", f"File is UNCHANGED\n\nFile: {os.path.basename(file_path)}\nHash: {result['hash'][:32]}...")
+            
+            self.log(f"Checked: {os.path.basename(file_path)} - {'CHANGED' if result['changed'] else 'OK'}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to check file: {str(e)}")
+    
+    def check_all_files(self):
+        """Check integrity of all monitored files"""
+        def check_thread():
+            try:
+                self.root.after(0, lambda: self.status_label.configure(text="Checking all files..."))
+                results = self.monitor.check_all_monitored_files()
+                
+                changed_files = [r for r in results if r.get('changed') == True]
+                unchanged_files = [r for r in results if r.get('changed') == False]
+                error_files = [r for r in results if 'error' in r]
+                
+                report = f"=== INTEGRITY CHECK REPORT ===\n"
+                report += f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                report += f"Total files checked: {len(results)}\n"
+                report += f"Unchanged files: {len(unchanged_files)}\n"
+                report += f"Changed files: {len(changed_files)}\n"
+                report += f"Error files: {len(error_files)}\n\n"
+                
+                if changed_files:
+                    report += "CHANGED FILES:\n" + "="*50 + "\n"
+                    for r in changed_files:
+                        report += f"📁 {os.path.basename(r['file_path'])}\n"
+                        report += f"   Path: {r['file_path']}\n"
+                        report += f"   Change: {r.get('change_type', 'modified').upper()}\n"
+                        if r.get('old_hash'):
+                            report += f"   Old Hash: {r['old_hash'][:32]}...\n"
+                        if r.get('new_hash'):
+                            report += f"   New Hash: {r['new_hash'][:32]}...\n"
+                        if r.get('old_size') is not None and r.get('new_size') is not None:
+                            report += f"   Size Change: {r['old_size']:,} → {r['new_size']:,} bytes\n"
+                        report += "\n"
+                
+                if error_files:
+                    report += "\nERROR FILES:\n" + "="*50 + "\n"
+                    for r in error_files:
+                        report += f"❌ {os.path.basename(r['file_path'])}\n"
+                        report += f"   Path: {r['file_path']}\n"
+                        report += f"   Error: {r['error']}\n\n"
+                
+                if unchanged_files:
+                    report += f"\nUNCHANGED FILES ({len(unchanged_files)}):\n" + "="*50 + "\n"
+                    for r in unchanged_files[:10]:  # Show first 10
+                        report += f"✅ {os.path.basename(r['file_path'])}\n"
+                    if len(unchanged_files) > 10:
+                        report += f"... and {len(unchanged_files) - 10} more unchanged files\n"
+                
+                self.root.after(0, lambda: [
+                    self.results_text.delete(1.0, tk.END),
+                    self.results_text.insert(tk.END, report),
+                    self.status_label.configure(text=f"Check complete: {len(changed_files)} changed, {len(unchanged_files)} OK"),
+                    self.log(f"Integrity check complete: {len(changed_files)} changed files found")
+                ])
+                
+                if changed_files:
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "Changes Detected", 
+                        f"Found {len(changed_files)} changed files!\nSee results tab for details."
+                    ))
+                
+            except Exception as e:
+                self.root.after(0, lambda: [
+                    messagebox.showerror("Error", f"Check failed: {str(e)}"),
+                    self.status_label.configure(text="Check failed")
+                ])
+        
+        thread = threading.Thread(target=check_thread)
+        thread.daemon = True
+        thread.start()
+    
+    def generate_report(self):
+        """Generate and save integrity report"""
+        try:
+            results = self.monitor.check_all_monitored_files()
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"integrity_report_{timestamp}.txt"
+            
+            filepath = filedialog.asksaveasfilename(
+                title="Save Integrity Report",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                initialname=filename
+            )
+            
+            if filepath:
+                with open(filepath, 'w') as f:
+                    f.write(self.results_text.get(1.0, tk.END))
+                
+                messagebox.showinfo("Report Saved", f"Integrity report saved to:\n{filepath}")
+                self.log(f"Report saved: {os.path.basename(filepath)}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate report: {str(e)}")
+    
+    def toggle_auto_check(self):
+        """Toggle automatic checking"""
+        if self.auto_check_var.get():
+            self.start_auto_check()
+        else:
+            self.stop_auto_check()
+    
+    def start_auto_check(self):
+        """Start automatic checking"""
+        if not self.auto_check_running:
+            self.auto_check_running = True
+            self.auto_check_thread = threading.Thread(target=self.auto_check_worker)
+            self.auto_check_thread.daemon = True
+            self.auto_check_thread.start()
+            self.log(f"Auto-check started (interval: {self.check_interval.get()}s)")
+    
+    def stop_auto_check(self):
+        """Stop automatic checking"""
+        self.auto_check_running = False
+        if self.auto_check_thread:
+            self.auto_check_thread = None
+        self.log("Auto-check stopped")
+    
+    def auto_check_worker(self):
+        """Auto-check worker thread"""
+        while self.auto_check_running and self.auto_check_var.get():
+            try:
+                results = self.monitor.check_all_monitored_files()
+                changed_files = [r for r in results if r.get('changed') == True]
+                
+                if changed_files:
+                    self.root.after(0, lambda: [
+                        self.log(f"Auto-check: {len(changed_files)} files changed!"),
+                        messagebox.showwarning("Auto-Check Alert", 
+                            f"Detected {len(changed_files)} changed files!\n"
+                            "Check the results tab for details.")
+                    ])
+                else:
+                    self.root.after(0, lambda: self.log("Auto-check: All files OK"))
+                
+                time.sleep(self.check_interval.get())
+                
+            except Exception as e:
+                self.root.after(0, lambda: self.log(f"Auto-check error: {str(e)}"))
+                time.sleep(10)  # Wait before retrying
+    
+    def refresh_history(self):
+        """Refresh change history"""
+        # Clear existing items
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        
+        # Get history
+        history = self.monitor.get_change_history()
+        
+        for change in history:
+            timestamp = change['timestamp'].split('T')[0] + ' ' + change['timestamp'].split('T')[1][:8]
+            file_name = os.path.basename(change['file_path'])
+            change_type = change['change_type'].upper()
+            
+            details = ""
+            if change['change_type'] == 'modified':
+                if change['old_size'] and change['new_size']:
+                    size_change = f"{change['old_size']:,} → {change['new_size']:,} bytes"
+                    details = f"Size: {size_change}"
+            elif change['change_type'] == 'deleted':
+                details = "File deleted"
+            
+            self.history_tree.insert('', 'end', values=(
+                timestamp, file_name, change_type, details
+            ))
+    
+    def clear_history(self):
+        """Clear change history"""
+        if messagebox.askyesno("Confirm", "Clear all change history?"):
+            try:
+                conn = sqlite3.connect(self.monitor.db_path)
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM change_log')
+                conn.commit()
+                conn.close()
+                
+                self.refresh_history()
+                self.log("Change history cleared")
+                messagebox.showinfo("Success", "Change history cleared")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to clear history: {str(e)}")
+    
+    def update_baseline_selected(self):
+        """Update baseline for selected file"""
+        selection = self.files_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file")
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        if messagebox.askyesno("Confirm", f"Update baseline hash for {os.path.basename(file_path)}?"):
+            try:
+                # Get current algorithm
+                files = self.monitor.get_monitored_files()
+                algorithm = None
+                for f in files:
+                    if f['file_path'] == file_path:
+                        algorithm = f['algorithm']
+                        break
+                
+                self.monitor.update_baseline(file_path, algorithm)
+                self.refresh_monitored_files()
+                self.log(f"Updated baseline: {os.path.basename(file_path)}")
+                messagebox.showinfo("Success", "Baseline updated")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update baseline: {str(e)}")
+    
+    def show_file_info(self):
+        """Show detailed info about selected file"""
+        selection = self.files_tree.selection()
+        if not selection:
+            return
+        
+        item = selection[0]
+        file_path = self.files_tree.item(item)['tags'][0]
+        
+        try:
+            # Get file info from database
+            files = self.monitor.get_monitored_files()
+            file_info = None
+            for f in files:
+                if f['file_path'] == file_path:
+                    file_info = f
+                    break
+            
+            if not file_info:
+                return
+            
+            # Get current file status
+            current_info = self.monitor.get_file_info(file_path)
+            
+            info_window = tk.Toplevel(self.root)
+            info_window.title(f"File Info - {os.path.basename(file_path)}")
+            info_window.geometry("500x400")
+            info_window.transient(self.root)
+            
+            info_text = scrolledtext.ScrolledText(info_window, height=20, width=60)
+            info_text.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            info = f"FILE INFORMATION\n{'='*50}\n\n"
+            info += f"File Path: {file_path}\n"
+            info += f"File Name: {os.path.basename(file_path)}\n"
+            info += f"Directory: {os.path.dirname(file_path)}\n\n"
+            
+            info += f"MONITORING INFO\n{'='*50}\n"
+            info += f"Hash Algorithm: {file_info['algorithm']}\n"
+            info += f"Stored Hash: {file_info['hash_value']}\n"
+            info += f"Stored Size: {file_info['file_size']:,} bytes\n"
+            info += f"Added to Monitor: {file_info['timestamp']}\n"
+            info += f"Status: {file_info['status']}\n\n"
+            
+            if current_info['exists']:
+                info += f"CURRENT STATUS\n{'='*50}\n"
+                info += f"Current Size: {current_info['size']:,} bytes\n"
+                info += f"Last Modified: {datetime.fromtimestamp(current_info['mtime']).isoformat()}\n"
+                
+                # Check if changed
+                try:
+                    result = self.monitor.check_file_integrity(file_path, file_info['algorithm'])
+                    if result['changed']:
+                        info += f"⚠️  FILE HAS CHANGED!\n"
+                        info += f"Change Type: {result.get('change_type', 'unknown')}\n"
+                        if result.get('new_hash'):
+                            info += f"Current Hash: {result['new_hash']}\n"
+                    else:
+                        info += f"✅ File is unchanged\n"
+                except:
+                    info += f"❓ Unable to check current status\n"
+            else:
+                info += f"CURRENT STATUS\n{'='*50}\n"
+                info += f"❌ FILE NOT FOUND\n"
+            
+            info_text.insert(tk.END, info)
+            info_text.configure(state='disabled')
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get file info: {str(e)}")
+    
+    def show_db_stats(self):
+        """Show database statistics"""
+        try:
+            conn = sqlite3.connect(self.monitor.db_path)
+            cursor = conn.cursor()
+            
+            # Get statistics
+            cursor.execute('SELECT COUNT(*) FROM file_hashes')
+            total_files = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM change_log')
+            total_changes = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT hash_algorithm, COUNT(*) FROM file_hashes GROUP BY hash_algorithm')
+            algo_stats = cursor.fetchall()
+            
+            cursor.execute('SELECT change_type, COUNT(*) FROM change_log GROUP BY change_type')
+            change_stats = cursor.fetchall()
+            
+            conn.close()
+            
+            # Show stats window
+            stats_window = tk.Toplevel(self.root)
+            stats_window.title("Database Statistics")
+            stats_window.geometry("400x300")
+            stats_window.transient(self.root)
+            
+            stats_text = scrolledtext.ScrolledText(stats_window, height=15, width=50)
+            stats_text.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            stats = f"DATABASE STATISTICS\n{'='*30}\n\n"
+            stats += f"Database File: {self.monitor.db_path}\n"
+            stats += f"Total Monitored Files: {total_files}\n"
+            stats += f"Total Recorded Changes: {total_changes}\n\n"
+            
+            if algo_stats:
+                stats += f"FILES BY ALGORITHM:\n{'-'*20}\n"
+                for algo, count in algo_stats:
+                    stats += f"{algo.upper()}: {count} files\n"
+                stats += "\n"
+            
+            if change_stats:
+                stats += f"CHANGES BY TYPE:\n{'-'*20}\n"
+                for change_type, count in change_stats:
+                    stats += f"{change_type.upper()}: {count} changes\n"
+            
+            stats_text.insert(tk.END, stats)
+            stats_text.configure(state='disabled')
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get statistics: {str(e)}")
+    
+    def export_config(self):
+        """Export monitored files configuration"""
+        try:
+            files = self.monitor.get_monitored_files()
+            
+            config = {
+                'export_timestamp': datetime.now().isoformat(),
+                'files': files
+            }
+            
+            filepath = filedialog.asksaveasfilename(
+                title="Export Configuration",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialname=f"file_monitor_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            
+            if filepath:
+                with open(filepath, 'w') as f:
+                    json.dump(config, f, indent=2)
+                
+                messagebox.showinfo("Export Complete", f"Configuration exported to:\n{filepath}")
+                self.log(f"Configuration exported: {os.path.basename(filepath)}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export configuration: {str(e)}")
+    
+    def import_config(self):
+        """Import monitored files configuration"""
+        filepath = filedialog.askopenfilename(
+            title="Import Configuration",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if filepath:
+            try:
+                with open(filepath, 'r') as f:
+                    config = json.load(f)
+                
+                if 'files' not in config:
+                    messagebox.showerror("Error", "Invalid configuration file format")
+                    return
+                
+                files = config['files']
+                imported_count = 0
+                
+                for file_info in files:
+                    try:
+                        file_path = file_info['file_path']
+                        if os.path.exists(file_path):
+                            self.monitor.add_file_to_monitor(file_path, file_info['algorithm'])
+                            imported_count += 1
+                    except Exception as e:
+                        print(f"Warning: Could not import {file_info.get('file_path', 'unknown')}: {e}")
+                
+                self.refresh_monitored_files()
+                messagebox.showinfo("Import Complete", 
+                    f"Imported {imported_count} files from configuration\n"
+                    f"Total files in config: {len(files)}")
+                self.log(f"Configuration imported: {imported_count} files added")
+            
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to import configuration: {str(e)}")
+    
+    def log(self, message):
+        """Add message to results log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_message = f"[{timestamp}] {message}\n"
+        
+        current_text = self.results_text.get(1.0, tk.END)
+        if len(current_text) > 10000:  # Keep log size manageable
+            self.results_text.delete(1.0, "5.0")
+        
+        self.results_text.insert(tk.END, log_message)
+        self.results_text.see(tk.END)
+        self.root.update_idletasks()
+
+
+def main():
+    """Main function - can be used for both GUI and CLI"""
+    parser = argparse.ArgumentParser(description='File Integrity Monitoring Tool')
+    parser.add_argument('--cli', action='store_true', help='Use command line interface')
+    parser.add_argument('--add-file', help='Add file to monitoring')
+    parser.add_argument('--add-dir', help='Add directory to monitoring')
+    parser.add_argument('--check', help='Check specific file integrity')
+    parser.add_argument('--check-all', action='store_true', help='Check all monitored files')
+    parser.add_argument('--list', action='store_true', help='List monitored files')
+    parser.add_argument('--remove', help='Remove file from monitoring')
+    parser.add_argument('--algorithm', default='sha256', choices=FileIntegrityMonitor.SUPPORTED_ALGORITHMS,
+                       help='Hash algorithm to use')
+    parser.add_argument('--recursive', action='store_true', help='Add directory recursively')
+    parser.add_argument('--db', default='file_integrity.db', help='Database file path')
+    
+    args = parser.parse_args()
+    
+    if args.cli or any([args.add_file, args.add_dir, args.check, args.check_all, args.list, args.remove]):
+        # Command line interface
+        monitor = FileIntegrityMonitor(args.db)
+        
+        try:
+            if args.add_file:
+                hash_value = monitor.add_file_to_monitor(args.add_file, args.algorithm)
+                print(f"✅ Added file: {args.add_file}")
+                print(f"   Hash ({args.algorithm}): {hash_value}")
+            
+            elif args.add_dir:
+                files = monitor.add_directory_to_monitor(args.add_dir, args.algorithm, args.recursive)
+                print(f"✅ Added {len(files)} files from directory: {args.add_dir}")
+            
+            elif args.check:
+                result = monitor.check_file_integrity(args.check, args.algorithm)
+                if result['changed']:
+                    print(f"⚠️  File CHANGED: {args.check}")
+                    print(f"   Change type: {result.get('change_type', 'modified')}")
+                    if result.get('old_hash') and result.get('new_hash'):
+                        print(f"   Old hash: {result['old_hash']}")
+                        print(f"   New hash: {result['new_hash']}")
+                else:
+                    print(f"✅ File OK: {args.check}")
+                    print(f"   Hash: {result['hash']}")
+            
+            elif args.check_all:
+                results = monitor.check_all_monitored_files()
+                changed = [r for r in results if r.get('changed') == True]
+                unchanged = [r for r in results if r.get('changed') == False]
+                errors = [r for r in results if 'error' in r]
+                
+                print(f"\n📊 INTEGRITY CHECK RESULTS")
+                print(f"{'='*40}")
+                print(f"Total files: {len(results)}")
+                print(f"✅ Unchanged: {len(unchanged)}")
+                print(f"⚠️  Changed: {len(changed)}")
+                print(f"❌ Errors: {len(errors)}")
+                
+                if changed:
+                    print(f"\nCHANGED FILES:")
+                    for r in changed:
+                        print(f"  ⚠️  {r['file_path']} ({r.get('change_type', 'modified')})")
+                
+                if errors:
+                    print(f"\nERROR FILES:")
+                    for r in errors:
+                        print(f"  ❌ {r['file_path']}: {r['error']}")
+            
+            elif args.list:
+                files = monitor.get_monitored_files()
+                print(f"\n📁 MONITORED FILES ({len(files)})")
+                print(f"{'='*60}")
+                for f in files:
+                    print(f"📄 {f['file_path']}")
+                    print(f"   Algorithm: {f['algorithm']}")
+                    print(f"   Size: {f['file_size']:,} bytes")
+                    print(f"   Hash: {f['hash_value'][:32]}...")
+                    print(f"   Added: {f['timestamp']}")
+                    print()
+            
+            elif args.remove:
+                if monitor.remove_from_monitoring(args.remove):
+                    print(f"✅ Removed from monitoring: {args.remove}")
+                else:
+                    print(f"❌ File not found in monitoring: {args.remove}")
+        
+        except Exception as e:
+            print(f"❌ Error: {str(e)}")
+            sys.exit(1)
+    
+    else:
+        # GUI interface
+        root = tk.Tk()
+        app = FileIntegrityGUI(root)
+        root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
